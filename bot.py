@@ -23,7 +23,7 @@ class TicketFlow(StatesGroup):
 
 # ================= TOPICS =================
 TOPICS = [
-    ("🐞 Баг", "BUG"),
+    ("🐞 Ошибка", "BUG"),
     ("❓ Вопрос", "QUESTION"),
     ("💡 Предложение", "IDEA"),
     ("💳 Оплата", "PAYMENT"),
@@ -31,6 +31,7 @@ TOPICS = [
     ("🧩 Другое", "OTHER"),
 ]
 
+# ================= KEYBOARDS =================
 def topics_kb():
     kb = InlineKeyboardBuilder()
     for t, c in TOPICS:
@@ -46,10 +47,18 @@ def back_kb():
 def attach_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="📎 Прикрепить файл", callback_data="attach_yes")
-    kb.button(text="✅ Без вложений", callback_data="attach_no")
+    kb.button(text="➡️ Продолжить без вложений", callback_data="attach_no")
     kb.adjust(1)
     return kb.as_markup()
 
+def finish_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Новое обращение", callback_data="new_ticket")
+    kb.button(text="🏠 В начало", callback_data="go_start")
+    kb.adjust(1)
+    return kb.as_markup()
+
+# ================= HELPERS =================
 def topic_title(code):
     for t, c in TOPICS:
         if c == code:
@@ -106,8 +115,19 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "Здравствуйте.\n\n"
         "🤖 Служба поддержки.\n"
-        "Здесь вы можете отправить обращение нашей команде.\n\n"
-        "Нажмите кнопку ниже, чтобы создать обращение.",
+        "Здесь вы можете отправить обращение нашей команде.",
+        reply_markup=kb.as_markup()
+    )
+
+@dp.callback_query(F.data == "go_start")
+async def go_start(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Создать обращение", callback_data="new_ticket")
+
+    await call.message.edit_text(
+        "Вы находитесь в начале диалога.\n\n"
+        "Нажмите кнопку ниже, чтобы создать новое обращение.",
         reply_markup=kb.as_markup()
     )
 
@@ -144,7 +164,7 @@ async def back_to_topics(call: CallbackQuery, state: FSMContext):
 async def get_details(message: Message, state: FSMContext):
     await state.update_data(details=message.text)
     await message.answer(
-        "📎 Хотите прикрепить файл (скриншот или видео), чтобы уточнить обращение?",
+        "📎 Хотите прикрепить файл (скриншот или видео) для уточнения обращения?",
         reply_markup=attach_kb()
     )
 
@@ -153,8 +173,9 @@ async def get_details(message: Message, state: FSMContext):
 async def no_attach(call: CallbackQuery, state: FSMContext):
     await send_ticket(call.from_user, state)
     await call.message.answer(
-        "✅ Обращение отправлено в поддержку.\n"
-        "Ответ будет направлен вам в этом чате."
+        "✅ Обращение принято.\n"
+        "Мы свяжемся с вами в ближайшее время.",
+        reply_markup=finish_kb()
     )
     await state.clear()
 
@@ -168,41 +189,3 @@ async def yes_attach(call: CallbackQuery, state: FSMContext):
 # ================= ATTACHMENT =================
 @dp.message(
     TicketFlow.waiting_attachment,
-    F.photo | F.video | F.document | F.video_note | F.voice
-)
-async def get_attachment(message: Message, state: FSMContext):
-    await send_ticket(message.from_user, state, attachment_message=message)
-    await message.answer(
-        "✅ Обращение и вложение отправлены в поддержку.\n"
-        "Ответ будет направлен вам в этом чате."
-    )
-    await state.clear()
-
-# ================= SEND =================
-async def send_ticket(user, state, attachment_message: Message | None = None):
-    data = await state.get_data()
-    topic = topic_title(data["topic"])
-    details = data["details"]
-
-    text = (
-        "📩 НОВОЕ ОБРАЩЕНИЕ\n\n"
-        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"👤 Пользователь: {user.full_name}\n"
-        f"🆔 Telegram ID: {user.id}\n"
-        f"📌 Категория: {topic}\n\n"
-        f"💬 Сообщение:\n{details}"
-    )
-
-    await bot.send_message(SUPPORT_CHAT_ID, text)
-
-    if attachment_message:
-        await attachment_message.forward(SUPPORT_CHAT_ID)
-
-# ================= MAIN =================
-async def main():
-    if not BOT_TOKEN or not SUPPORT_CHAT_ID:
-        raise RuntimeError("Проверь BOT_TOKEN и SUPPORT_CHAT_ID в переменных окружения.")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
