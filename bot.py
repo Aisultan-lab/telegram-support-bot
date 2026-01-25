@@ -1,631 +1,309 @@
 import os
 import json
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, List, Optional
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from dotenv import load_dotenv
-
-
-# =========================
-# CONFIG
-# =========================
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SUPPORT_CHAT_ID_RAW = os.getenv("SUPPORT_CHAT_ID", "").strip()
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавь BOT_TOKEN в Environment Variables на Render.")
+    raise RuntimeError("BOT_TOKEN не задан")
 
-if not SUPPORT_CHAT_ID_RAW:
-    raise RuntimeError("Не задан SUPPORT_CHAT_ID. Добавь SUPPORT_CHAT_ID (ID группы) в Environment Variables на Render.")
+SUPPORT_CHAT_ID = None
+CFG_FILE = "support_cfg.json"
+DATA_FILE = "tickets.json"
 
-try:
-    SUPPORT_CHAT_ID = int(SUPPORT_CHAT_ID_RAW)
-except ValueError:
-    raise RuntimeError("SUPPORT_CHAT_ID должен быть числом, например -1001234567890")
+# ---------------- DATA ----------------
 
-MAX_ATTACHMENTS = 5
+@dataclass
+class TicketUser:
+    user_id: int
+    username: str | None
+    full_name: str
 
-DB_FILE = "tickets_db.json"  # простая база в файле (для Render обычно хватает; при новом деплое может сброситься)
+@dataclass
+class Ticket:
+    id: int
+    status: str
+    topic: str
+    text: str
+    created: str
+    user: TicketUser
+    attachments: list
+    group_msg_id: int | None = None
 
+tickets: Dict[int, Ticket] = {}
+ticket_counter = 0
+admin_reply_wait: Dict[int, int] = {}
 
-# =========================
-# CATEGORIES (настройка)
-# =========================
-CATEGORIES = [
-    ("bug", "🐞 Баг"),
-    ("question", "❓ Вопрос"),
-    ("suggestion", "💡 Предложение"),
-    ("payment", "💳 Оплата"),
-    ("login", "🔐 Вход"),
-    ("other", "🧩 Другое"),
-]
+# ---------------- UTILS ----------------
 
-CATEGORY_MAP = {k: v for k, v in CATEGORIES}
+def now():
+    return datetime.utcnow().isoformat()
 
+def save_cfg():
+    with open(CFG_FILE, "w") as f:
+        json.dump({"support_chat_id": SUPPORT_CHAT_ID}, f)
 
-# =========================
-# STATES
-# =========================
-class TicketStates(StatesGroup):
-    category = State()
-    details = State()
+def load_cfg():
+    global SUPPORT_CHAT_ID
+    if os.path.exists(CFG_FILE):
+        with open(CFG_FILE) as f:
+            SUPPORT_CHAT_ID = json.load(f).get("support_chat_id")
 
+def save_tickets():
+    with open(DATA_FILE, "w") as f:
+        json.dump({
+            "counter": ticket_counter,
+            "tickets": {k: asdict(v) for k, v in tickets.items()}
+        }, f, ensure_ascii=False)
 
-class SupportStates(StatesGroup):
-    waiting_reply = State()
+def load_tickets():
+    global ticket_counter, tickets
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f:
+            data = json.load(f)
+            ticket_counter = data["counter"]
+            tickets = {int(k): Ticket(**v) for k, v in data["tickets"].items()}
 
+def next_id():
+    global ticket_counter
+    ticket_counter += 1
+    return ticket_counter
 
-# =========================
-# SIMPLE DB
-# =========================
-def _db_load() -> Dict[str, Any]:
-    if not os.path.exists(DB_FILE):
-        return {"seq": 0, "tickets": {}}
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"seq": 0, "tickets": {}}
+def extract_media(msg: Message):
+    if msg.photo:
+        return ("photo", msg.photo[-1].file_id)
+    if msg.video:
+        return ("video", msg.video.file_id)
+    if msg.document:
+        return ("document", msg.document.file_id)
+    return None
 
+# ---------------- FSM ----------------
 
-def _db_save(db: Dict[str, Any]) -> None:
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+class Form(StatesGroup):
+    topic = State()
+    text = State()
+    files = State()
 
+# ---------------- KEYBOARDS ----------------
 
-def db_new_ticket(payload: Dict[str, Any]) -> int:
-    db = _db_load()
-    db["seq"] += 1
-    ticket_id = db["seq"]
-    db["tickets"][str(ticket_id)] = payload
-    _db_save(db)
-    return ticket_id
-
-
-def db_get_ticket(ticket_id: int) -> Optional[Dict[str, Any]]:
-    db = _db_load()
-    return db["tickets"].get(str(ticket_id))
-
-
-def db_update_ticket(ticket_id: int, patch: Dict[str, Any]) -> None:
-    db = _db_load()
-    t = db["tickets"].get(str(ticket_id))
-    if not t:
-        return
-    t.update(patch)
-    db["tickets"][str(ticket_id)] = t
-    _db_save(db)
-
-
-# =========================
-# KEYBOARDS
-# =========================
-def kb_home() -> InlineKeyboardMarkup:
+def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Новое обращение", callback_data="ticket:new")],
-        [InlineKeyboardButton(text="🏠 В начало", callback_data="ticket:home")],
+        [InlineKeyboardButton(text="➕ Новое обращение", callback_data="new")]
     ])
 
-
-def kb_start() -> InlineKeyboardMarkup:
+def kb_topics():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать обращение", callback_data="ticket:new")],
+        [InlineKeyboardButton(text="🐞 Баг", callback_data="bug")],
+        [InlineKeyboardButton(text="❓ Вопрос", callback_data="question")],
+        [InlineKeyboardButton(text="💡 Предложение", callback_data="idea")],
+        [InlineKeyboardButton(text="💳 Оплата", callback_data="payment")],
+        [InlineKeyboardButton(text="🧩 Другое", callback_data="other")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
     ])
 
+def kb_send():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="send")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
+    ])
 
-def kb_categories() -> InlineKeyboardMarkup:
-    rows = []
-    for k, title in CATEGORIES:
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"ticket:cat:{k}")])
-    rows.append([InlineKeyboardButton(text="🏠 В начало", callback_data="ticket:home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def kb_details_actions(can_submit: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if can_submit:
-        rows.append([InlineKeyboardButton(text="✅ Отправить обращение", callback_data="ticket:submit")])
-    rows.append([InlineKeyboardButton(text="📎 Добавить файл (скрин/видео)", callback_data="ticket:addfile")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад (выбор темы)", callback_data="ticket:back")])
-    rows.append([InlineKeyboardButton(text="🏠 В начало", callback_data="ticket:home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def kb_support_actions(ticket_id: int) -> InlineKeyboardMarkup:
+def kb_admin(tid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟡 В работе", callback_data=f"support:inwork:{ticket_id}"),
-            InlineKeyboardButton(text="✉️ Ответить", callback_data=f"support:reply:{ticket_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="✅ Закрыть", callback_data=f"support:close:{ticket_id}")
+            InlineKeyboardButton(text="🟡 В работе", callback_data=f"work:{tid}"),
+            InlineKeyboardButton(text="✉ Ответить", callback_data=f"reply:{tid}"),
+            InlineKeyboardButton(text="✅ Закрыть", callback_data=f"close:{tid}")
         ]
     ])
 
+# ---------------- ROUTERS ----------------
 
-# =========================
-# HELPERS
-# =========================
-def user_contact_block(user: Message) -> str:
-    u = user.from_user
-    username = f"@{u.username}" if u.username else "нет"
-    tg_link = f"https://t.me/{u.username}" if u.username else f"tg://user?id={u.id}"
-    return (
-        f"👤 Пользователь: {u.full_name}\n"
-        f"🆔 Telegram ID: {u.id}\n"
-        f"👤 Username: {username}\n"
-        f"🔗 Написать: {tg_link}"
-    )
+user = Router()
+admin = Router()
 
+# ---------------- USER ----------------
 
-async def add_attachment(state: FSMContext, att_type: str, file_id: str) -> bool:
-    data = await state.get_data()
-    attachments = data.get("attachments", [])
-    if len(attachments) >= MAX_ATTACHMENTS:
-        return False
-    attachments.append({"type": att_type, "file_id": file_id})
-    await state.update_data(attachments=attachments)
-    return True
-
-
-def attachments_count(data: Dict[str, Any]) -> int:
-    return len(data.get("attachments", []))
-
-
-# =========================
-# ROUTER
-# =========================
-router = Router()
-
-
-# -------------------------
-# START / HOME
-# -------------------------
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+@user.message(CommandStart())
+async def start(msg: Message, state: FSMContext):
     await state.clear()
-    text = (
-        "👋 Здравствуйте.\n\n"
-        "Это служба поддержки. Здесь можно быстро создать обращение по приложению.\n"
-        "Нажмите кнопку ниже, чтобы начать."
-    )
-    await message.answer(text, reply_markup=kb_start())
-
-
-@router.callback_query(F.data == "ticket:home")
-async def cb_home(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text(
-        "🏠 Главное меню\n\nНажмите «Создать обращение», чтобы написать в поддержку.",
+    await msg.answer(
+        "Здравствуйте.\n"
+        "Это служба поддержки.\n\n"
+        "Нажмите кнопку ниже для создания обращения.",
         reply_markup=kb_start()
     )
-    await call.answer()
 
+@user.callback_query(F.data == "new")
+async def new_ticket(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.topic)
+    await cb.message.edit_text("Выберите тему обращения:", reply_markup=kb_topics())
+    await cb.answer()
 
-@router.callback_query(F.data == "ticket:new")
-async def cb_new(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(TicketStates.category)
-    await call.message.edit_text(
-        "📌 Выберите тему обращения:",
-        reply_markup=kb_categories()
+@user.callback_query(Form.topic)
+async def choose_topic(cb: CallbackQuery, state: FSMContext):
+    if cb.data == "back":
+        await state.clear()
+        await cb.message.edit_text("Главное меню", reply_markup=kb_start())
+        return
+    await state.update_data(topic=cb.data, files=[])
+    await state.set_state(Form.text)
+    await cb.message.edit_text("Опишите проблему одним сообщением.")
+    await cb.answer()
+
+@user.message(Form.text)
+async def get_text(msg: Message, state: FSMContext):
+    await state.update_data(text=msg.text)
+    await state.set_state(Form.files)
+    await msg.answer(
+        "Прикрепите файлы (если нужно) или нажмите «Отправить».",
+        reply_markup=kb_send()
     )
-    await call.answer()
 
+@user.message(Form.files)
+async def get_files(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    media = extract_media(msg)
+    if media:
+        data["files"].append(media)
+        await state.update_data(files=data["files"])
+        await msg.answer("Файл добавлен. Можно отправить ещё или нажать «Отправить».")
 
-# -------------------------
-# CATEGORY CHOICE
-# -------------------------
-@router.callback_query(TicketStates.category, F.data.startswith("ticket:cat:"))
-async def cb_category(call: CallbackQuery, state: FSMContext):
-    cat_key = call.data.split(":")[-1]
-    if cat_key not in CATEGORY_MAP:
-        await call.answer("Неизвестная категория", show_alert=True)
+@user.callback_query(Form.files, F.data == "send")
+async def send_ticket(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    global SUPPORT_CHAT_ID
+    load_cfg()
+    if not SUPPORT_CHAT_ID:
+        await cb.message.edit_text("Группа поддержки не настроена.")
         return
 
-    await state.update_data(category=cat_key, details=None, attachments=[])
-    await state.set_state(TicketStates.details)
+    data = await state.get_data()
+    tid = next_id()
 
-    await call.message.edit_text(
-        f"✅ Тема: {CATEGORY_MAP[cat_key]}\n\n"
-        "Опишите ситуацию одним сообщением.\n"
-        "Если есть скрин/видео — можете отправить сразу (можно до 5 файлов).",
-        reply_markup=kb_details_actions(can_submit=False)
+    user_data = TicketUser(
+        user_id=cb.from_user.id,
+        username=cb.from_user.username,
+        full_name=cb.from_user.full_name
     )
-    await call.answer()
 
+    ticket = Ticket(
+        id=tid,
+        status="new",
+        topic=data["topic"],
+        text=data["text"],
+        created=now(),
+        user=user_data,
+        attachments=data["files"]
+    )
 
-@router.callback_query(TicketStates.details, F.data == "ticket:back")
-async def cb_back(call: CallbackQuery, state: FSMContext):
-    # Разрешаем сменить категорию только через "Назад"
-    await state.update_data(category=None, details=None, attachments=[])
-    await state.set_state(TicketStates.category)
-    await call.message.edit_text("📌 Выберите тему обращения:", reply_markup=kb_categories())
-    await call.answer()
+    tickets[tid] = ticket
+    save_tickets()
 
-
-# -------------------------
-# DETAILS: "add file" button (подсказка)
-# -------------------------
-@router.callback_query(TicketStates.details, F.data == "ticket:addfile")
-async def cb_add_file(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("📎 Пришлите файл (скриншот / видео / документ). Можно до 5 файлов.")
-
-
-# -------------------------
-# DETAILS: attachments handlers (фикс твоей проблемы)
-# Принимаем файлы в любой момент, пока собираем обращение
-# -------------------------
-@router.message(TicketStates.details, F.photo)
-async def details_photo(message: Message, state: FSMContext):
-    ok = await add_attachment(state, "photo", message.photo[-1].file_id)
-    if not ok:
-        await message.answer("⚠️ Можно прикрепить не более 5 файлов.")
-        return
-
-    data = await state.get_data()
-    can_submit = bool(data.get("details"))
-    if can_submit:
-        await message.answer("📎 Файл добавлен. Можно отправить обращение или добавить ещё.", reply_markup=kb_details_actions(True))
-    else:
-        await message.answer("📎 Файл получен. Теперь опишите ситуацию текстом.", reply_markup=kb_details_actions(False))
-
-
-@router.message(TicketStates.details, F.video)
-async def details_video(message: Message, state: FSMContext):
-    ok = await add_attachment(state, "video", message.video.file_id)
-    if not ok:
-        await message.answer("⚠️ Можно прикрепить не более 5 файлов.")
-        return
-
-    data = await state.get_data()
-    can_submit = bool(data.get("details"))
-    if can_submit:
-        await message.answer("📎 Видео добавлено. Можно отправить обращение или добавить ещё.", reply_markup=kb_details_actions(True))
-    else:
-        await message.answer("📎 Видео получено. Теперь опишите ситуацию текстом.", reply_markup=kb_details_actions(False))
-
-
-@router.message(TicketStates.details, F.document)
-async def details_document(message: Message, state: FSMContext):
-    ok = await add_attachment(state, "document", message.document.file_id)
-    if not ok:
-        await message.answer("⚠️ Можно прикрепить не более 5 файлов.")
-        return
-
-    data = await state.get_data()
-    can_submit = bool(data.get("details"))
-    if can_submit:
-        await message.answer("📎 Файл добавлен. Можно отправить обращение или добавить ещё.", reply_markup=kb_details_actions(True))
-    else:
-        await message.answer("📎 Файл получен. Теперь опишите ситуацию текстом.", reply_markup=kb_details_actions(False))
-
-
-# -------------------------
-# DETAILS: text handler
-# -------------------------
-@router.message(TicketStates.details, F.text)
-async def details_text(message: Message, state: FSMContext):
-    txt = message.text.strip()
-    if not txt:
-        await message.answer("Пожалуйста, напишите описание текстом.")
-        return
-
-    await state.update_data(details=txt)
-    data = await state.get_data()
-
-    att_cnt = attachments_count(data)
-    if att_cnt > 0:
-        msg = f"✅ Текст сохранён. Прикреплено файлов: {att_cnt}.\n\nМожете отправить обращение."
-    else:
-        msg = "✅ Текст сохранён.\n\nЕсли нужно — прикрепите скрин/видео, либо сразу отправьте обращение."
-
-    await message.answer(msg, reply_markup=kb_details_actions(can_submit=True))
-
-
-# -------------------------
-# SUBMIT TICKET
-# -------------------------
-@router.callback_query(TicketStates.details, F.data == "ticket:submit")
-async def cb_submit(call: CallbackQuery, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-
-    cat_key = data.get("category")
-    details = data.get("details")
-    if not cat_key or not details:
-        await call.answer("Нужно выбрать тему и написать описание.", show_alert=True)
-        return
-
-    now = datetime.utcnow().isoformat()
-
-    # создаём тикет
-    ticket_payload = {
-        "created_at": now,
-        "status": "new",
-        "category": cat_key,
-        "details": details,
-        "attachments": data.get("attachments", []),
-        "user_id": call.from_user.id,
-        "username": call.from_user.username,
-        "full_name": call.from_user.full_name,
-        "support_msg_id": None,
-    }
-    ticket_id = db_new_ticket(ticket_payload)
-
-    # 1) сообщение в поддержку (группу)
-    username = f"@{call.from_user.username}" if call.from_user.username else "нет"
-    tg_link = f"https://t.me/{call.from_user.username}" if call.from_user.username else f"tg://user?id={call.from_user.id}"
-
-    support_text = (
-        f"📩 ОБРАЩЕНИЕ #{ticket_id}\n"
+    text = (
+        f"📩 ОБРАЩЕНИЕ #{tid}\n"
         f"Статус: 🔵 Новое\n\n"
-        f"{user_contact_block(call.message)}\n\n"
-        f"📌 Тема: {CATEGORY_MAP.get(cat_key, cat_key)}\n\n"
-        f"💬 Сообщение:\n{details}\n\n"
-        f"👤 Username: {username}\n"
-        f"🔗 Ссылка: {tg_link}"
+        f"👤 {user_data.full_name}\n"
+        f"🆔 {user_data.user_id}\n"
+        f"👤 @{user_data.username or 'нет'}\n\n"
+        f"📌 Тема: {data['topic']}\n\n"
+        f"💬 {data['text']}"
     )
 
-    sent = await bot.send_message(
-        chat_id=SUPPORT_CHAT_ID,
-        text=support_text,
-        reply_markup=kb_support_actions(ticket_id)
+    msg = await bot.send_message(
+        SUPPORT_CHAT_ID,
+        text,
+        reply_markup=kb_admin(tid)
     )
 
-    # 2) отправка вложений в поддержку
-    attachments = data.get("attachments", [])
-    if attachments:
-        for att in attachments:
-            at = att.get("type")
-            fid = att.get("file_id")
-            caption = f"📎 Вложение к обращению #{ticket_id}"
-            try:
-                if at == "photo":
-                    await bot.send_photo(SUPPORT_CHAT_ID, fid, caption=caption)
-                elif at == "video":
-                    await bot.send_video(SUPPORT_CHAT_ID, fid, caption=caption)
-                elif at == "document":
-                    await bot.send_document(SUPPORT_CHAT_ID, fid, caption=caption)
-            except Exception:
-                # если файл не отправился — не ломаем процесс
-                await bot.send_message(SUPPORT_CHAT_ID, f"⚠️ Не удалось отправить вложение к обращению #{ticket_id} (тип: {at}).")
+    ticket.group_msg_id = msg.message_id
+    save_tickets()
 
-    db_update_ticket(ticket_id, {"support_msg_id": sent.message_id})
+    for t, fid in ticket.attachments:
+        if t == "photo":
+            await bot.send_photo(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
+        if t == "video":
+            await bot.send_video(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
+        if t == "document":
+            await bot.send_document(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
 
-    # 3) ответ пользователю (нормально, делово)
-    await call.message.edit_text(
+    await state.clear()
+    await cb.message.edit_text(
         "✅ Обращение принято.\n"
-        "Мы свяжемся с вами в ближайшее время в этом чате.",
-        reply_markup=kb_home()
+        "Мы свяжемся с вами в ближайшее время.",
+        reply_markup=kb_start()
     )
 
-    await state.clear()
-    await call.answer()
+# ---------------- ADMIN ----------------
 
+@admin.message(Command("set_support"))
+async def set_support(msg: Message):
+    global SUPPORT_CHAT_ID
+    SUPPORT_CHAT_ID = msg.chat.id
+    save_cfg()
+    await msg.answer("✅ Группа поддержки установлена.")
 
-# =========================
-# SUPPORT SIDE (GROUP)
-# =========================
-# Вариант управления в группе:
-# - 🟡 В работе: меняем статус, редактируем сообщение в группе
-# - ✉️ Ответить: бот попросит текст ответа (следующее сообщение поддержки станет ответом)
-# - ✅ Закрыть: уведомляем пользователя и закрываем тикет
-#
-# ВАЖНО: Чтобы бот работал в группе, добавь его как администратора и /setprivacy -> Disable
+@admin.callback_query(F.data.startswith("work:"))
+async def set_work(cb: CallbackQuery, bot: Bot):
+    tid = int(cb.data.split(":")[1])
+    tickets[tid].status = "in_work"
+    save_tickets()
+    await cb.answer("В работе")
 
-
-def _render_support_text(ticket_id: int, ticket: Dict[str, Any]) -> str:
-    status = ticket.get("status", "new")
-    status_label = {
-        "new": "🔵 Новое",
-        "in_work": "🟡 В работе",
-        "closed": "✅ Закрыто",
-    }.get(status, status)
-
-    cat = ticket.get("category", "other")
-    details = ticket.get("details", "")
-
-    username = f"@{ticket.get('username')}" if ticket.get("username") else "нет"
-    user_id = ticket.get("user_id")
-    tg_link = f"https://t.me/{ticket.get('username')}" if ticket.get("username") else f"tg://user?id={user_id}"
-
-    return (
-        f"📩 ОБРАЩЕНИЕ #{ticket_id}\n"
-        f"Статус: {status_label}\n\n"
-        f"👤 Пользователь: {ticket.get('full_name','')}\n"
-        f"🆔 Telegram ID: {user_id}\n"
-        f"👤 Username: {username}\n"
-        f"🔗 Написать: {tg_link}\n\n"
-        f"📌 Тема: {CATEGORY_MAP.get(cat, cat)}\n\n"
-        f"💬 Сообщение:\n{details}"
+@admin.callback_query(F.data.startswith("close:"))
+async def close(cb: CallbackQuery, bot: Bot):
+    tid = int(cb.data.split(":")[1])
+    tickets[tid].status = "closed"
+    save_tickets()
+    await bot.send_message(
+        tickets[tid].user.user_id,
+        f"✅ Обращение №{tid} закрыто.\nЕсли понадобится помощь — создайте новое обращение.",
+        reply_markup=kb_start()
     )
+    await cb.answer("Закрыто")
 
+@admin.callback_query(F.data.startswith("reply:"))
+async def reply(cb: CallbackQuery):
+    tid = int(cb.data.split(":")[1])
+    admin_reply_wait[tid] = cb.from_user.id
+    await cb.message.reply("Напишите ответ следующим сообщением.")
+    await cb.answer()
 
-@router.callback_query(F.data.startswith("support:inwork:"))
-async def support_in_work(call: CallbackQuery, bot: Bot):
-    ticket_id = int(call.data.split(":")[-1])
-    ticket = db_get_ticket(ticket_id)
-    if not ticket:
-        await call.answer("Тикет не найден", show_alert=True)
-        return
-
-    if ticket.get("status") == "closed":
-        await call.answer("Тикет уже закрыт", show_alert=True)
-        return
-
-    db_update_ticket(ticket_id, {"status": "in_work"})
-    ticket = db_get_ticket(ticket_id)
-
-    # редактируем сообщение в группе
-    try:
-        await call.message.edit_text(_render_support_text(ticket_id, ticket), reply_markup=kb_support_actions(ticket_id))
-    except Exception:
-        pass
-
-    await call.answer("Статус: В работе")
-
-
-@router.callback_query(F.data.startswith("support:reply:"))
-async def support_reply_start(call: CallbackQuery, state: FSMContext):
-    ticket_id = int(call.data.split(":")[-1])
-    ticket = db_get_ticket(ticket_id)
-    if not ticket:
-        await call.answer("Тикет не найден", show_alert=True)
-        return
-
-    if ticket.get("status") == "closed":
-        await call.answer("Тикет закрыт. Ответить нельзя.", show_alert=True)
-        return
-
-    # Ставим состояние для сотрудника (кто нажал кнопку)
-    await state.set_state(SupportStates.waiting_reply)
-    await state.update_data(reply_ticket_id=ticket_id)
-
-    await call.message.answer(
-        f"✉️ Ответ пользователю по обращению #{ticket_id}\n"
-        "Напишите текст ответа одним сообщением."
-    )
-    await call.answer()
-
-
-@router.message(SupportStates.waiting_reply, F.text)
-async def support_reply_send(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    ticket_id = data.get("reply_ticket_id")
-    if not ticket_id:
-        await state.clear()
-        return
-
-    ticket = db_get_ticket(int(ticket_id))
-    if not ticket:
-        await message.answer("Тикет не найден.")
-        await state.clear()
-        return
-
-    user_id = ticket.get("user_id")
-    if not user_id:
-        await message.answer("Не найден user_id у тикета.")
-        await state.clear()
-        return
-
-    text = message.text.strip()
-    if not text:
-        await message.answer("Пустой ответ. Напишите текст.")
-        return
-
-    # сообщение пользователю (не сырое)
-    user_msg = (
-        f"📬 Ответ по вашему обращению #{ticket_id}:\n"
-        f"{text}\n\n"
-        "Если вопрос ещё актуален — можете создать новое обращение."
-    )
-
-    try:
-        await bot.send_message(chat_id=int(user_id), text=user_msg, reply_markup=kb_home())
-    except Exception:
-        await message.answer("⚠️ Не удалось отправить пользователю (возможно, он заблокировал бота).")
-        await state.clear()
-        return
-
-    # фиксируем статус
-    db_update_ticket(int(ticket_id), {"status": "in_work", "last_reply_at": datetime.utcnow().isoformat()})
-
-    await message.answer(f"✅ Ответ отправлен пользователю по обращению #{ticket_id}.")
-    await state.clear()
-
-
-@router.callback_query(F.data.startswith("support:close:"))
-async def support_close(call: CallbackQuery, bot: Bot):
-    ticket_id = int(call.data.split(":")[-1])
-    ticket = db_get_ticket(ticket_id)
-    if not ticket:
-        await call.answer("Тикет не найден", show_alert=True)
-        return
-
-    if ticket.get("status") == "closed":
-        await call.answer("Тикет уже закрыт", show_alert=True)
-        return
-
-    db_update_ticket(ticket_id, {"status": "closed", "closed_at": datetime.utcnow().isoformat()})
-    ticket = db_get_ticket(ticket_id)
-
-    # уведомляем пользователя (нормально, без “обращение закрыто” как ошибка)
-    user_id = ticket.get("user_id")
-    if user_id:
-        try:
+@admin.message(F.chat.type.in_(["group", "supergroup"]))
+async def admin_reply(msg: Message, bot: Bot):
+    for tid, admin_id in list(admin_reply_wait.items()):
+        if msg.from_user.id == admin_id:
+            user_id = tickets[tid].user.user_id
             await bot.send_message(
-                chat_id=int(user_id),
-                text=(
-                    f"✅ Мы завершили обработку обращения #{ticket_id}.\n"
-                    "Если потребуется дополнительная помощь — создайте новое обращение."
-                ),
-                reply_markup=kb_home()
+                user_id,
+                f"📩 Ответ по обращению №{tid}:\n{msg.text}",
+                reply_markup=kb_start()
             )
-        except Exception:
-            pass
+            admin_reply_wait.pop(tid)
+            await msg.reply("Ответ отправлен.")
+            break
 
-    # редактируем сообщение в группе
-    try:
-        await call.message.edit_text(_render_support_text(ticket_id, ticket), reply_markup=kb_support_actions(ticket_id))
-    except Exception:
-        pass
+# ---------------- START ----------------
 
-    await call.answer("Тикет закрыт")
-
-
-# =========================
-# OPTIONAL: Команда /set_support для группы (можно удалить потом)
-# =========================
-# Если ты хочешь НЕ через SUPPORT_CHAT_ID, а установить чат автоматически:
-# 1) Включи Privacy Disable (BotFather)
-# 2) Добавь бота в группу, напиши /set_support
-# 3) Бот покажет ID группы (можно потом вставить в SUPPORT_CHAT_ID)
-#
-# --- ПОСЛЕ НАСТРОЙКИ МОЖЕШЬ УДАЛИТЬ ВЕСЬ БЛОК НИЖЕ ---
-@router.message(Command("set_support"))
-async def cmd_set_support(message: Message):
-    # Работает только в группах
-    if message.chat.type not in ("group", "supergroup"):
-        await message.answer("Эта команда работает только в группе поддержки.")
-        return
-
-    await message.answer(
-        f"✅ Группа поддержки установлена.\n"
-        f"ID этой группы: `{message.chat.id}`\n\n"
-        f"Добавь это число в Render → SUPPORT_CHAT_ID",
-        parse_mode="Markdown"
-    )
-# --- КОНЕЦ БЛОКА /set_support ---
-
-
-# =========================
-# MAIN
-# =========================
 async def main():
-    bot = Bot(token=BOT_TOKEN)
+    load_cfg()
+    load_tickets()
+    bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    print("Bot started")
+    dp.include_router(user)
+    dp.include_router(admin)
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
