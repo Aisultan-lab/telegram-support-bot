@@ -210,3 +210,9 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    from aiogram import types
+from aiogram.filters import Command
+
+@dp.message(Command("get_chat_id"))
+async def get_chat_id(message: types.Message):
+    await message.answer(f"Chat ID: `{message.chat.id}`", parse_mode="Markdown")
