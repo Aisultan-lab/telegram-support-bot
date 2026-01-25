@@ -189,3 +189,42 @@ async def yes_attach(call: CallbackQuery, state: FSMContext):
 # ================= ATTACHMENT =================
 @dp.message(
     TicketFlow.waiting_attachment,
+    F.photo | F.video | F.document | F.video_note | F.voice
+)
+async def get_attachment(message: Message, state: FSMContext):
+    await send_ticket(message.from_user, state, attachment_message=message)
+    await message.answer(
+        "✅ Обращение принято.\n"
+        "Мы свяжемся с вами в ближайшее время.",
+        reply_markup=finish_kb()
+    )
+    await state.clear()
+
+# ================= SEND =================
+async def send_ticket(user, state, attachment_message: Message | None = None):
+    data = await state.get_data()
+    topic = topic_title(data["topic"])
+    details = data["details"]
+
+    text = (
+        "📩 НОВОЕ ОБРАЩЕНИЕ\n\n"
+        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"👤 Пользователь: {user.full_name}\n"
+        f"🆔 Telegram ID: {user.id}\n"
+        f"📌 Категория: {topic}\n\n"
+        f"💬 Сообщение:\n{details}"
+    )
+
+    await bot.send_message(SUPPORT_CHAT_ID, text)
+
+    if attachment_message:
+        await attachment_message.forward(SUPPORT_CHAT_ID)
+
+# ================= MAIN =================
+async def main():
+    if not BOT_TOKEN or not SUPPORT_CHAT_ID:
+        raise RuntimeError("Проверь BOT_TOKEN и SUPPORT_CHAT_ID в переменных окружения.")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
