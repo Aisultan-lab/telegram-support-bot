@@ -1,308 +1,173 @@
 import os
-import json
 import asyncio
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Dict, List, Optional
-
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан")
+SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
 
-SUPPORT_CHAT_ID = None
-CFG_FILE = "support_cfg.json"
-DATA_FILE = "tickets.json"
+# -------- FSM --------
 
-# ---------------- DATA ----------------
-
-@dataclass
-class TicketUser:
-    user_id: int
-    username: str | None
-    full_name: str
-
-@dataclass
-class Ticket:
-    id: int
-    status: str
-    topic: str
-    text: str
-    created: str
-    user: TicketUser
-    attachments: list
-    group_msg_id: int | None = None
-
-tickets: Dict[int, Ticket] = {}
-ticket_counter = 0
-admin_reply_wait: Dict[int, int] = {}
-
-# ---------------- UTILS ----------------
-
-def now():
-    return datetime.utcnow().isoformat()
-
-def save_cfg():
-    with open(CFG_FILE, "w") as f:
-        json.dump({"support_chat_id": SUPPORT_CHAT_ID}, f)
-
-def load_cfg():
-    global SUPPORT_CHAT_ID
-    if os.path.exists(CFG_FILE):
-        with open(CFG_FILE) as f:
-            SUPPORT_CHAT_ID = json.load(f).get("support_chat_id")
-
-def save_tickets():
-    with open(DATA_FILE, "w") as f:
-        json.dump({
-            "counter": ticket_counter,
-            "tickets": {k: asdict(v) for k, v in tickets.items()}
-        }, f, ensure_ascii=False)
-
-def load_tickets():
-    global ticket_counter, tickets
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            data = json.load(f)
-            ticket_counter = data["counter"]
-            tickets = {int(k): Ticket(**v) for k, v in data["tickets"].items()}
-
-def next_id():
-    global ticket_counter
-    ticket_counter += 1
-    return ticket_counter
-
-def extract_media(msg: Message):
-    if msg.photo:
-        return ("photo", msg.photo[-1].file_id)
-    if msg.video:
-        return ("video", msg.video.file_id)
-    if msg.document:
-        return ("document", msg.document.file_id)
-    return None
-
-# ---------------- FSM ----------------
-
-class Form(StatesGroup):
-    topic = State()
+class TicketFlow(StatesGroup):
+    category = State()
     text = State()
-    files = State()
 
-# ---------------- KEYBOARDS ----------------
+# -------- Keyboards --------
 
 def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Новое обращение", callback_data="new")]
+        [InlineKeyboardButton(text="➕ Создать обращение", callback_data="new")]
     ])
 
-def kb_topics():
+def kb_categories():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🐞 Баг", callback_data="bug")],
         [InlineKeyboardButton(text="❓ Вопрос", callback_data="question")],
         [InlineKeyboardButton(text="💡 Предложение", callback_data="idea")],
-        [InlineKeyboardButton(text="💳 Оплата", callback_data="payment")],
         [InlineKeyboardButton(text="🧩 Другое", callback_data="other")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
 
-def kb_send():
+def kb_user_after():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить", callback_data="send")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")]
+        [InlineKeyboardButton(text="➕ Новое обращение", callback_data="new")],
+        [InlineKeyboardButton(text="🏠 В начало", callback_data="home")]
     ])
 
-def kb_admin(tid):
+def kb_admin(ticket_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟡 В работе", callback_data=f"work:{tid}"),
-            InlineKeyboardButton(text="✉ Ответить", callback_data=f"reply:{tid}"),
-            InlineKeyboardButton(text="✅ Закрыть", callback_data=f"close:{tid}")
+            InlineKeyboardButton(text="🟡 В работе", callback_data=f"work:{ticket_id}"),
+            InlineKeyboardButton(text="✉️ Ответить", callback_data=f"reply:{ticket_id}"),
+            InlineKeyboardButton(text="✅ Закрыть", callback_data=f"close:{ticket_id}")
         ]
     ])
 
-# ---------------- ROUTERS ----------------
+# -------- Router --------
 
-user = Router()
-admin = Router()
+router = Router()
+ticket_counter = 0
+reply_wait = {}
 
-# ---------------- USER ----------------
+# -------- User --------
 
-@user.message(CommandStart())
+@router.message(CommandStart())
 async def start(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(
-        "Здравствуйте.\n"
-        "Это служба поддержки.\n\n"
-        "Нажмите кнопку ниже для создания обращения.",
+        "Здравствуйте.\n\n"
+        "Это служба поддержки.\n"
+        "Нажмите кнопку ниже, чтобы создать обращение.",
         reply_markup=kb_start()
     )
 
-@user.callback_query(F.data == "new")
-async def new_ticket(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Form.topic)
-    await cb.message.edit_text("Выберите тему обращения:", reply_markup=kb_topics())
+@router.callback_query(F.data == "home")
+async def home(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Главное меню.", reply_markup=kb_start())
     await cb.answer()
 
-@user.callback_query(Form.topic)
-async def choose_topic(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "new")
+async def new_ticket(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(TicketFlow.category)
+    await cb.message.edit_text("Выберите тему обращения:", reply_markup=kb_categories())
+    await cb.answer()
+
+@router.callback_query(TicketFlow.category)
+async def choose_category(cb: CallbackQuery, state: FSMContext):
     if cb.data == "back":
         await state.clear()
-        await cb.message.edit_text("Главное меню", reply_markup=kb_start())
+        await cb.message.edit_text("Главное меню.", reply_markup=kb_start())
         return
-    await state.update_data(topic=cb.data, files=[])
-    await state.set_state(Form.text)
-    await cb.message.edit_text("Опишите проблему одним сообщением.")
+
+    await state.update_data(category=cb.data)
+    await state.set_state(TicketFlow.text)
+    await cb.message.edit_text(
+        "Опишите ситуацию одним сообщением.\n"
+        "Вы можете прикрепить скриншот или видео следующим сообщением."
+    )
     await cb.answer()
 
-@user.message(Form.text)
-async def get_text(msg: Message, state: FSMContext):
-    await state.update_data(text=msg.text)
-    await state.set_state(Form.files)
-    await msg.answer(
-        "Прикрепите файлы (если нужно) или нажмите «Отправить».",
-        reply_markup=kb_send()
-    )
-
-@user.message(Form.files)
-async def get_files(msg: Message, state: FSMContext):
+@router.message(TicketFlow.text)
+async def receive_text(msg: Message, state: FSMContext, bot: Bot):
+    global ticket_counter
+    ticket_counter += 1
     data = await state.get_data()
-    media = extract_media(msg)
-    if media:
-        data["files"].append(media)
-        await state.update_data(files=data["files"])
-        await msg.answer("Файл добавлен. Можно отправить ещё или нажать «Отправить».")
 
-@user.callback_query(Form.files, F.data == "send")
-async def send_ticket(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    global SUPPORT_CHAT_ID
-    load_cfg()
-    if not SUPPORT_CHAT_ID:
-        await cb.message.edit_text("Группа поддержки не настроена.")
-        return
-
-    data = await state.get_data()
-    tid = next_id()
-
-    user_data = TicketUser(
-        user_id=cb.from_user.id,
-        username=cb.from_user.username,
-        full_name=cb.from_user.full_name
-    )
-
-    ticket = Ticket(
-        id=tid,
-        status="new",
-        topic=data["topic"],
-        text=data["text"],
-        created=now(),
-        user=user_data,
-        attachments=data["files"]
-    )
-
-    tickets[tid] = ticket
-    save_tickets()
-
+    user = msg.from_user
     text = (
-        f"📩 ОБРАЩЕНИЕ #{tid}\n"
+        f"📩 ОБРАЩЕНИЕ #{ticket_counter}\n"
         f"Статус: 🔵 Новое\n\n"
-        f"👤 {user_data.full_name}\n"
-        f"🆔 {user_data.user_id}\n"
-        f"👤 @{user_data.username or 'нет'}\n\n"
-        f"📌 Тема: {data['topic']}\n\n"
-        f"💬 {data['text']}"
+        f"👤 Пользователь: {user.full_name}\n"
+        f"🆔 Telegram ID: {user.id}\n"
+        f"👤 Username: @{user.username if user.username else 'нет'}\n"
+        f"🔗 Написать: tg://user?id={user.id}\n\n"
+        f"📌 Тема: {data['category']}\n\n"
+        f"💬 Сообщение:\n{msg.text}"
     )
 
-    msg = await bot.send_message(
+    sent = await bot.send_message(
         SUPPORT_CHAT_ID,
         text,
-        reply_markup=kb_admin(tid)
+        reply_markup=kb_admin(ticket_counter)
     )
 
-    ticket.group_msg_id = msg.message_id
-    save_tickets()
-
-    for t, fid in ticket.attachments:
-        if t == "photo":
-            await bot.send_photo(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
-        if t == "video":
-            await bot.send_video(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
-        if t == "document":
-            await bot.send_document(SUPPORT_CHAT_ID, fid, reply_to_message_id=msg.message_id)
-
-    await state.clear()
-    await cb.message.edit_text(
+    await msg.answer(
         "✅ Обращение принято.\n"
         "Мы свяжемся с вами в ближайшее время.",
-        reply_markup=kb_start()
+        reply_markup=kb_user_after()
     )
 
-# ---------------- ADMIN ----------------
+    await state.clear()
 
-@admin.message(Command("set_support"))
-async def set_support(msg: Message):
-    global SUPPORT_CHAT_ID
-    SUPPORT_CHAT_ID = msg.chat.id
-    save_cfg()
-    await msg.answer("✅ Группа поддержки установлена.")
+# -------- Admin --------
 
-@admin.callback_query(F.data.startswith("work:"))
-async def set_work(cb: CallbackQuery, bot: Bot):
-    tid = int(cb.data.split(":")[1])
-    tickets[tid].status = "in_work"
-    save_tickets()
-    await cb.answer("В работе")
-
-@admin.callback_query(F.data.startswith("close:"))
-async def close(cb: CallbackQuery, bot: Bot):
-    tid = int(cb.data.split(":")[1])
-    tickets[tid].status = "closed"
-    save_tickets()
-    await bot.send_message(
-        tickets[tid].user.user_id,
-        f"✅ Обращение №{tid} закрыто.\nЕсли понадобится помощь — создайте новое обращение.",
-        reply_markup=kb_start()
-    )
-    await cb.answer("Закрыто")
-
-@admin.callback_query(F.data.startswith("reply:"))
-async def reply(cb: CallbackQuery):
-    tid = int(cb.data.split(":")[1])
-    admin_reply_wait[tid] = cb.from_user.id
+@router.callback_query(F.data.startswith("reply:"))
+async def admin_reply(cb: CallbackQuery):
+    tid = cb.data.split(":")[1]
+    reply_wait[cb.from_user.id] = tid
     await cb.message.reply("Напишите ответ следующим сообщением.")
     await cb.answer()
 
-@admin.message(F.chat.type.in_(["group", "supergroup"]))
-async def admin_reply(msg: Message, bot: Bot):
-    for tid, admin_id in list(admin_reply_wait.items()):
-        if msg.from_user.id == admin_id:
-            user_id = tickets[tid].user.user_id
-            await bot.send_message(
-                user_id,
-                f"📩 Ответ по обращению №{tid}:\n{msg.text}",
-                reply_markup=kb_start()
-            )
-            admin_reply_wait.pop(tid)
-            await msg.reply("Ответ отправлен.")
-            break
+@router.message(F.chat.id == SUPPORT_CHAT_ID)
+async def admin_send_reply(msg: Message, bot: Bot):
+    admin_id = msg.from_user.id
+    if admin_id not in reply_wait:
+        return
 
-# ---------------- START ----------------
+    tid = reply_wait.pop(admin_id)
+    await bot.send_message(
+        msg.reply_to_message.text.split("tg://user?id=")[1].split("\n")[0],
+        f"📩 Ответ от службы поддержки:\n\n{msg.text}",
+        reply_markup=kb_user_after()
+    )
+    await msg.reply("✅ Ответ отправлен пользователю.")
+
+@router.callback_query(F.data.startswith("close:"))
+async def admin_close(cb: CallbackQuery, bot: Bot):
+    await bot.send_message(
+        cb.message.text.split("tg://user?id=")[1].split("\n")[0],
+        "✅ Мы завершили обработку вашего обращения.\n"
+        "Если потребуется помощь — создайте новое обращение.",
+        reply_markup=kb_user_after()
+    )
+    await cb.answer("Обращение закрыто")
+
+# -------- Start --------
 
 async def main():
-    load_cfg()
-    load_tickets()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(user)
-    dp.include_router(admin)
+    dp.include_router(router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
