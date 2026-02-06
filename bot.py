@@ -93,6 +93,9 @@ class Ticket:
     payment_price_rub: Optional[int] = None # 1499/2999/...
     subscription_added: bool = False        # отмечено админом
 
+    # Добавлено: email пользователя (для начисления подписки)
+    payment_email: Optional[str] = None
+
 tickets: Dict[int, Ticket] = {}
 ticket_counter = 0
 
@@ -107,6 +110,8 @@ class Flow(StatesGroup):
 
     # Добавлено: оплата РФ
     payment_plan = State()        # выбор периода
+    payment_email = State()       # ввод email
+    payment_confirm = State()     # подтверждение данных
     payment_wait_receipt = State()# ожидание чека
 
 # -------------------- UI клавиатуры --------------------
@@ -183,6 +188,16 @@ def kb_payment_help() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏠 В начало", callback_data="u:home")],
     ])
 
+# Добавлено: подтверждение данных оплаты (тариф + email)
+def kb_payment_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Всё верно", callback_data="u:pay_confirm_ok")],
+        [InlineKeyboardButton(text="✏️ Изменить email", callback_data="u:pay_change_email")],
+        [InlineKeyboardButton(text="🔁 Изменить период", callback_data="u:pay_change_plan")],
+        [InlineKeyboardButton(text="👤 Связаться с админом", callback_data="u:pay_contact_admin")],
+        [InlineKeyboardButton(text="🏠 В начало", callback_data="u:home")],
+    ])
+
 # -------------------- Helpers --------------------
 def user_card(user_id: int, username: Optional[str], full_name: str) -> str:
     uname = f"@{username}" if username else "нет"
@@ -201,8 +216,15 @@ def render_ticket_text(t: Ticket) -> str:
     if t.category == "PAYMENT_RU":
         plan = PLAN_TITLE.get(t.payment_plan or "", "—")
         price = f"{t.payment_price_rub} ₽" if t.payment_price_rub else "—"
+        email = t.payment_email or "—"
         mark = "✅ Подписка добавлена" if t.subscription_added else "⏳ Ожидаем чек/проверку"
-        extra = f"\n\n💰 Оплата РФ (QR)\n📆 Период: {plan}\n💵 Сумма: {price}\n📌 Статус оплаты: {mark}"
+        extra = (
+            f"\n\n💰 Оплата РФ (QR)\n"
+            f"📆 Период: {plan}\n"
+            f"💵 Сумма: {price}\n"
+            f"✉️ Email: {email}\n"
+            f"📌 Статус оплаты: {mark}"
+        )
 
     return (
         f"📩 ОБРАЩЕНИЕ #{t.ticket_id}\n"
@@ -262,6 +284,37 @@ def safe_qr_inputfile(plan_key: str) -> Optional[FSInputFile]:
     if not os.path.exists(path):
         return None
     return FSInputFile(path)
+
+# Добавлено: простая проверка email
+def is_valid_email(s: str) -> bool:
+    s = (s or "").strip()
+    if " " in s:
+        return False
+    if "@" not in s:
+        return False
+    local, _, domain = s.partition("@")
+    if not local or not domain:
+        return False
+    if "." not in domain:
+        return False
+    if domain.startswith(".") or domain.endswith("."):
+        return False
+    return True
+
+# Добавлено: текст подтверждения оплаты
+def payment_confirm_text(data: dict) -> str:
+    plan_key = data.get("payment_plan")
+    title = PLAN_TITLE.get(plan_key or "", "—")
+    price = PLAN_PRICE.get(plan_key or "", "—")
+    email = data.get("payment_email") or "—"
+    return (
+        "🧾 Проверьте данные перед оплатой:\n\n"
+        f"📆 Период: {title}\n"
+        f"💵 Сумма: {price} ₽\n"
+        f"✉️ Email: {email}\n\n"
+        "Если всё верно — нажмите «✅ Всё верно».\n"
+        "После этого мы покажем QR-код, и вы сможете отправить чек."
+    )
 
 # -------------------- Router --------------------
 router = Router()
@@ -341,25 +394,94 @@ async def payment_pick_plan(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer("Неизвестный период", show_alert=True)
         return
 
-    await state.update_data(payment_plan=plan_key, payment_price=PLAN_PRICE.get(plan_key))
-    await state.set_state(Flow.payment_wait_receipt)
+    # сохраняем период и сумму, дальше просим email
+    await state.update_data(payment_plan=plan_key, payment_price=PLAN_PRICE.get(plan_key), payment_email=None)
+    await state.set_state(Flow.payment_email)
 
     title = PLAN_TITLE[plan_key]
     price = PLAN_PRICE[plan_key]
 
-    # Показ QR (как фото) + инструкция
+    await call.answer()
+    await call.message.answer(
+        "💳 Оплата РФ (QR)\n\n"
+        f"📆 Период: {title}\n"
+        f"💵 Сумма: {price} ₽\n\n"
+        "✉️ Укажите email, с которым вы регистрировались в приложении.\n"
+        "Отправьте email одним сообщением.",
+        reply_markup=kb_payment_help()
+    )
+
+@router.message(Flow.payment_email)
+async def payment_email_any(message: Message, state: FSMContext):
+    if not (message.text and message.text.strip()):
+        await message.answer(
+            "Пожалуйста, отправьте email текстом одним сообщением.",
+            reply_markup=kb_payment_help()
+        )
+        return
+
+    email = message.text.strip()
+    if not is_valid_email(email):
+        await message.answer(
+            "⚠️ Пожалуйста, укажите корректный email (пример: name@gmail.com).",
+            reply_markup=kb_payment_help()
+        )
+        return
+
+    await state.update_data(payment_email=email)
+    data = await state.get_data()
+    await state.set_state(Flow.payment_confirm)
+
+    await message.answer(
+        payment_confirm_text(data),
+        reply_markup=kb_payment_confirm()
+    )
+
+@router.callback_query(Flow.payment_confirm, F.data == "u:pay_change_email")
+async def pay_change_email(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.payment_email)
+    await call.answer()
+    await call.message.answer(
+        "✉️ Укажите email, с которым вы регистрировались в приложении.\n"
+        "Отправьте email одним сообщением.",
+        reply_markup=kb_payment_help()
+    )
+
+@router.callback_query(Flow.payment_confirm, F.data == "u:pay_change_plan")
+async def pay_change_plan(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.payment_plan)
+    await call.answer()
+    await call.message.answer(
+        "💳 Оплата РФ (QR)\n\nВыберите период подписки:",
+        reply_markup=kb_payment_plans()
+    )
+
+@router.callback_query(Flow.payment_confirm, F.data == "u:pay_confirm_ok")
+async def pay_confirm_ok(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    plan_key = data.get("payment_plan")
+    email = data.get("payment_email")
+    if not plan_key or plan_key not in PLAN_TITLE or not email or not is_valid_email(email):
+        await call.answer("Не хватает данных. Проверьте период и email.", show_alert=True)
+        return
+
+    title = PLAN_TITLE[plan_key]
+    price = PLAN_PRICE[plan_key]
+
     qr_file = safe_qr_inputfile(plan_key)
     text = (
         f"💳 Оплата РФ (QR)\n\n"
         f"📆 Период: {title}\n"
-        f"💵 Сумма: {price} ₽\n\n"
+        f"💵 Сумма: {price} ₽\n"
+        f"✉️ Email: {email}\n\n"
         "1) Оплатите по QR.\n"
         "2) Затем отправьте сюда чек/скрин оплаты (фото или файл).\n\n"
         "Если возникнут сложности — нажмите «👤 Связаться с админом»."
     )
 
+    await state.set_state(Flow.payment_wait_receipt)
     await call.answer()
-    # аккуратно: если картинка не найдена — просто покажем инструкцию
+
     if qr_file:
         await call.message.answer_photo(qr_file, caption=text, reply_markup=kb_payment_help())
     else:
@@ -371,6 +493,7 @@ async def payment_contact_admin(call: CallbackQuery, state: FSMContext, bot: Bot
     plan_key = data.get("payment_plan")
     title = PLAN_TITLE.get(plan_key or "", "—")
     price = PLAN_PRICE.get(plan_key or "", "—")
+    email = data.get("payment_email") or "—"
 
     u = call.from_user
     uname = f"@{u.username}" if u.username else "нет"
@@ -384,6 +507,7 @@ async def payment_contact_admin(call: CallbackQuery, state: FSMContext, bot: Bot
             f"🆔 Telegram ID: {u.id}\n"
             f"👤 Username: {uname}\n"
             f"🔗 Написать: {link}\n\n"
+            f"✉️ Email: {email}\n"
             f"📆 Период: {title}\n"
             f"💵 Сумма: {price} ₽\n\n"
             "Комментарий: Пользователь нажал «Связаться с админом» во время оплаты."
@@ -408,8 +532,12 @@ async def payment_wait_receipt_any(message: Message, state: FSMContext, bot: Bot
 
     data = await state.get_data()
     plan_key = data.get("payment_plan")
-    if not plan_key:
-        await message.answer("⚠️ Не выбран период. Нажмите «⬅️ Назад» и выберите период.", reply_markup=kb_payment_help())
+    email = data.get("payment_email")
+    if not plan_key or plan_key not in PLAN_TITLE or not email or not is_valid_email(email):
+        await message.answer(
+            "⚠️ Не хватает данных (период/email). Нажмите «🏠 В начало» и начните заново.",
+            reply_markup=kb_payment_help()
+        )
         return
 
     # создаём тикет оплаты РФ
@@ -430,6 +558,7 @@ async def payment_wait_receipt_any(message: Message, state: FSMContext, bot: Bot
         payment_plan=plan_key,
         payment_price_rub=PLAN_PRICE.get(plan_key),
         subscription_added=False,
+        payment_email=email,
     )
     tickets[t.ticket_id] = t
 
